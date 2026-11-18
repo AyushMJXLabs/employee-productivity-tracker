@@ -17,6 +17,23 @@ function toSqliteQuery(sql, params = []) {
   return { sql: converted, params: expanded };
 }
 
+function isTransientPgError(err) {
+  if (!err) return false;
+  const code = String(err.code || '');
+  const msg = String(err.message || '');
+  return (
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNREFUSED' ||
+    code === '57P01' ||
+    code === '57P02' ||
+    code === '57P03' ||
+    /Connection terminated unexpectedly/i.test(msg) ||
+    /Client has encountered a connection error/i.test(msg)
+  );
+}
+
 /**
  * Creates a unified async database client supporting PostgreSQL (DATABASE_URL)
  * and built-in Node SQLite (fallback for local or single-disk deployments).
@@ -34,20 +51,42 @@ async function createDb(config) {
     const pool = new Pool({
       connectionString: config.databaseUrl,
       ssl: useSsl ? { rejectUnauthorized: false } : false,
+      max: 10,
+      idleTimeoutMillis: 20000,
+      connectionTimeoutMillis: 10000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000,
     });
+
+    // Prevent unhandled 'error' events on idle PG clients from crashing the Node process
+    pool.on('error', (err) => {
+      console.error('[db] Idle PostgreSQL client error:', err.message);
+    });
+
+    async function pgExec(sql, params = []) {
+      try {
+        return await pool.query(sql, params);
+      } catch (err) {
+        if (isTransientPgError(err)) {
+          console.warn('[db] Retrying PostgreSQL query after transient connection error:', err.message);
+          return await pool.query(sql, params);
+        }
+        throw err;
+      }
+    }
 
     driver = {
       type: 'postgres',
       async query(sql, params = []) {
-        const res = await pool.query(sql, params);
+        const res = await pgExec(sql, params);
         return res.rows;
       },
       async get(sql, params = []) {
-        const res = await pool.query(sql, params);
+        const res = await pgExec(sql, params);
         return res.rows[0] || null;
       },
       async run(sql, params = []) {
-        const res = await pool.query(sql, params);
+        const res = await pgExec(sql, params);
         return { rowCount: res.rowCount, rows: res.rows };
       },
       async close() {
@@ -138,8 +177,24 @@ async function initSchema(db, config) {
       person_name TEXT NOT NULL,
       project TEXT NOT NULL,
       work_done TEXT NOT NULL,
+      client_request_id TEXT,
       logged_at TEXT NOT NULL
     )
+  `);
+
+  if (db.type === 'postgres') {
+    await db.run('ALTER TABLE work_logs ADD COLUMN IF NOT EXISTS client_request_id TEXT');
+  } else {
+    const logCols = await db.query('PRAGMA table_info(work_logs)');
+    if (!logCols.some((c) => c.name === 'client_request_id')) {
+      await db.run('ALTER TABLE work_logs ADD COLUMN client_request_id TEXT');
+    }
+  }
+
+  await db.run(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_work_logs_user_req
+    ON work_logs (user_id, client_request_id)
+    WHERE client_request_id IS NOT NULL
   `);
 
   await db.run(`

@@ -162,12 +162,27 @@ test('Full isolation, multi-entry logging, and executive oversight', async () =>
 
     const logA2 = await empA.request('/api/logs', {
       method: 'POST',
+      headers: { 'X-Idempotency-Key': 'idem-key-1' },
       body: JSON.stringify({
         project: 'Alpha CRM',
         workDone: 'Added unit tests for token refresh',
+        clientRequestId: 'idem-key-1',
       }),
     });
     assert.equal(logA2.status, 201);
+
+    // Retrying with the same idempotency key must return the existing row without duplicating
+    const logA2Retry = await empA.request('/api/logs', {
+      method: 'POST',
+      headers: { 'X-Idempotency-Key': 'idem-key-1' },
+      body: JSON.stringify({
+        project: 'Alpha CRM',
+        workDone: 'Added unit tests for token refresh',
+        clientRequestId: 'idem-key-1',
+      }),
+    });
+    assert.equal(logA2Retry.status, 200);
+    assert.equal(logA2Retry.body.log.id, logA2.body.log.id);
 
     const logB1 = await empB.request('/api/logs', {
       method: 'POST',

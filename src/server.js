@@ -474,6 +474,11 @@ function createApp(db, config) {
     try {
       const project = String(req.body?.project || '').trim();
       const workDone = String(req.body?.workDone || '').trim();
+      const rawClientReqId = String(
+        req.get('x-idempotency-key') || req.body?.clientRequestId || ''
+      ).trim();
+      const clientRequestId =
+        rawClientReqId && rawClientReqId.length <= 80 ? rawClientReqId : null;
 
       if (!project || project.length > 120) {
         return res.status(400).json({ error: 'Project name is required (max 120 characters).' });
@@ -482,16 +487,57 @@ function createApp(db, config) {
         return res.status(400).json({ error: 'Work description is required (max 2000 characters).' });
       }
 
+      if (clientRequestId) {
+        const existingLog = await db.get(
+          `SELECT id, user_id, person_name, project, work_done, logged_at
+           FROM work_logs
+           WHERE user_id = $1 AND client_request_id = $2`,
+          [req.user.id, clientRequestId]
+        );
+        if (existingLog) {
+          return res.status(200).json({
+            log: {
+              id: Number(existingLog.id),
+              userId: Number(existingLog.user_id),
+              personName: existingLog.person_name,
+              project: existingLog.project,
+              workDone: existingLog.work_done,
+              loggedAt: existingLog.logged_at,
+            },
+          });
+        }
+      }
+
       // Server enforces person_name and timestamp so entries cannot be spoofed
       const loggedAt = new Date().toISOString();
-      const inserted = await db.run(
-        `INSERT INTO work_logs (user_id, person_name, project, work_done, logged_at)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, user_id, person_name, project, work_done, logged_at`,
-        [req.user.id, req.user.name, project, workDone, loggedAt]
-      );
+      let row;
+      try {
+        const inserted = await db.run(
+          `INSERT INTO work_logs (user_id, person_name, project, work_done, client_request_id, logged_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id, user_id, person_name, project, work_done, logged_at`,
+          [req.user.id, req.user.name, project, workDone, clientRequestId, loggedAt]
+        );
+        row = inserted.rows[0];
+      } catch (insertErr) {
+        // Handle concurrent duplicate retry on unique (user_id, client_request_id)
+        if (clientRequestId) {
+          const existingLog = await db.get(
+            `SELECT id, user_id, person_name, project, work_done, logged_at
+             FROM work_logs
+             WHERE user_id = $1 AND client_request_id = $2`,
+            [req.user.id, clientRequestId]
+          );
+          if (existingLog) {
+            row = existingLog;
+          } else {
+            throw insertErr;
+          }
+        } else {
+          throw insertErr;
+        }
+      }
 
-      const row = inserted.rows[0];
       return res.status(201).json({
         log: {
           id: Number(row.id),
@@ -849,6 +895,9 @@ async function startServer() {
       `[server] ${config.appTitle} listening on port ${config.port} (db=${db.type}, env=${config.nodeEnv})`
     );
   });
+  // Keep Node's HTTP keep-alive longer than Render's reverse proxy to avoid socket-reset "Load failed"
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
 
   const shutdown = async () => {
     server.close(async () => {

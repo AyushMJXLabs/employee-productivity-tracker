@@ -52,21 +52,59 @@
     }, 3200);
   }
 
-  async function api(url, options = {}) {
-    const res = await fetch(url, {
-      credentials: 'same-origin',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(options.headers || {}),
-      },
-      ...options,
-    });
-    const contentType = res.headers.get('content-type') || '';
-    const data = contentType.includes('application/json') ? await res.json() : null;
-    if (!res.ok) {
-      throw new Error(data?.error || `Request failed (${res.status})`);
+  function makeRequestId() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
     }
-    return data;
+    return `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  function isTransientFetchError(err) {
+    return (
+      err instanceof TypeError ||
+      /load failed|failed to fetch|networkerror|network request failed/i.test(err?.message || '')
+    );
+  }
+
+  async function api(url, options = {}) {
+    const method = (options.method || 'GET').toUpperCase();
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    };
+    const hasIdempotencyKey = Boolean(headers['X-Idempotency-Key'] || headers['x-idempotency-key']);
+    const canRetry =
+      method === 'GET' || method === 'HEAD' || method === 'PUT' || method === 'DELETE' || hasIdempotencyKey;
+    const delays = canRetry ? [350, 1000] : [];
+
+    let lastErr;
+    for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+      try {
+        const res = await fetch(url, {
+          credentials: 'same-origin',
+          ...options,
+          headers,
+        });
+        if (canRetry && (res.status === 502 || res.status === 503 || res.status === 504) && attempt < delays.length) {
+          await new Promise((r) => setTimeout(r, delays[attempt]));
+          continue;
+        }
+        const contentType = res.headers.get('content-type') || '';
+        const data = contentType.includes('application/json') ? await res.json() : null;
+        if (!res.ok) {
+          throw new Error(data?.error || `Request failed (${res.status})`);
+        }
+        return data;
+      } catch (err) {
+        lastErr = err;
+        if (canRetry && isTransientFetchError(err) && attempt < delays.length) {
+          await new Promise((r) => setTimeout(r, delays[attempt]));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr;
   }
 
   function formatDateTime(isoString) {
@@ -692,22 +730,37 @@
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const btn = form.querySelector('button[type="submit"]');
+      const originalLabel = btn.textContent;
       btn.disabled = true;
+      btn.textContent = 'Saving…';
+      const clientRequestId = makeRequestId();
       try {
-        await api('/api/logs', {
+        const created = await api('/api/logs', {
           method: 'POST',
+          headers: {
+            'X-Idempotency-Key': clientRequestId,
+          },
           body: JSON.stringify({
             project: projectInput.value,
             workDone: workInput.value,
+            clientRequestId,
           }),
         });
         workInput.value = '';
-        await refreshWorkspaceData();
+        if (created?.log) {
+          state.logs.unshift(created.log);
+        }
+        try {
+          await refreshWorkspaceData();
+        } catch {
+          // Entry is already saved; ignore transient refresh hiccup
+        }
         render();
         toast('Work entry logged.');
       } catch (err) {
         toast(err.message, true);
         btn.disabled = false;
+        btn.textContent = originalLabel;
       }
     });
   }
