@@ -323,6 +323,9 @@
     }
 
     const isLogin = state.authMode === 'login';
+    const isRegister = state.authMode === 'register';
+    const isForgot = state.authMode === 'forgot';
+
     appEl.innerHTML = `
       <div class="auth-page">
         <div class="auth-card">
@@ -335,10 +338,10 @@
           </div>
 
           <div class="segmented" role="tablist">
-            <button type="button" class="segmented-btn ${isLogin ? 'active' : ''}" data-mode="login">
+            <button type="button" class="segmented-btn ${isLogin || isForgot ? 'active' : ''}" data-mode="login">
               Sign In
             </button>
-            <button type="button" class="segmented-btn ${!isLogin ? 'active' : ''}" data-mode="register">
+            <button type="button" class="segmented-btn ${isRegister ? 'active' : ''}" data-mode="register">
               Join Team
             </button>
           </div>
@@ -346,15 +349,40 @@
           <div id="auth-error"></div>
 
           ${
-            isLogin
+            isForgot
               ? `
+            <form id="forgot-form" class="form-stack">
+              <p class="auth-subtitle" style="margin-bottom: 4px;">
+                Submit a password reset request to your team lead using your work email and the Team Invite Code.
+              </p>
+              <div class="field">
+                <label for="forgot-email">Work Email</label>
+                <input id="forgot-email" class="input" type="email" autocomplete="email" required placeholder="you@company.com" />
+              </div>
+              <div class="field">
+                <label for="forgot-invite">Team Invite Code</label>
+                <input id="forgot-invite" class="input" type="text" required placeholder="Provided by your team lead" />
+              </div>
+              <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 4px;">
+                Request Password Reset
+              </button>
+              <div style="text-align: center;">
+                <button type="button" id="back-to-login-btn" class="link-btn">Back to Sign In</button>
+              </div>
+            </form>
+          `
+              : isLogin
+                ? `
             <form id="login-form" class="form-stack">
               <div class="field">
                 <label for="login-email">Work Email</label>
                 <input id="login-email" class="input" type="email" autocomplete="email" required placeholder="you@company.com" />
               </div>
               <div class="field">
-                <label for="login-password">Password</label>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <label for="login-password">Password</label>
+                  <button type="button" id="forgot-pw-link" class="link-btn">Forgot password?</button>
+                </div>
                 <input id="login-password" class="input" type="password" autocomplete="current-password" required />
               </div>
               <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 4px;">
@@ -362,7 +390,7 @@
               </button>
             </form>
           `
-              : `
+                : `
             <form id="register-form" class="form-stack">
               <div class="field">
                 <label for="reg-name">Full Name</label>
@@ -402,7 +430,38 @@
       });
     });
 
-    if (isLogin) {
+    if (isForgot) {
+      document.getElementById('back-to-login-btn').addEventListener('click', () => {
+        state.authMode = 'login';
+        renderAuthView();
+      });
+      document.getElementById('forgot-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const errBox = document.getElementById('auth-error');
+        errBox.innerHTML = '';
+        const btn = e.target.querySelector('button[type="submit"]');
+        btn.disabled = true;
+        try {
+          const res = await api('/api/auth/forgot-password', {
+            method: 'POST',
+            body: JSON.stringify({
+              email: document.getElementById('forgot-email').value,
+              inviteCode: document.getElementById('forgot-invite').value,
+            }),
+          });
+          errBox.innerHTML = `<div class="alert alert-success">${escapeHtml(res.message)}</div>`;
+          e.target.reset();
+        } catch (err) {
+          errBox.innerHTML = `<div class="alert alert-error">${escapeHtml(err.message)}</div>`;
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    } else if (isLogin) {
+      document.getElementById('forgot-pw-link').addEventListener('click', () => {
+        state.authMode = 'forgot';
+        renderAuthView();
+      });
       document.getElementById('login-form').addEventListener('submit', async (e) => {
         e.preventDefault();
         const errBox = document.getElementById('auth-error');
@@ -483,6 +542,7 @@
               <span class="user-name">${escapeHtml(state.user.name)}</span>
               <span class="role-badge ${isBoss ? 'boss' : ''}">${isBoss ? 'Executive' : 'Member'}</span>
             </div>
+            <button type="button" id="change-pw-btn" class="btn btn-ghost btn-sm">Password</button>
             <button type="button" id="logout-btn" class="btn btn-secondary btn-sm">Sign Out</button>
           </div>
         </div>
@@ -491,6 +551,47 @@
   }
 
   function bindTopbarEvents() {
+    document.getElementById('change-pw-btn')?.addEventListener('click', () => {
+      openModal(
+        'Change Password',
+        `
+          <form id="change-pw-form" class="form-stack">
+            <div class="field">
+              <label for="cur-pw">Current Password</label>
+              <input id="cur-pw" class="input" type="password" required autocomplete="current-password" />
+            </div>
+            <div class="field">
+              <label for="new-pw">New Password (min 6 characters)</label>
+              <input id="new-pw" class="input" type="password" required minlength="6" autocomplete="new-password" />
+            </div>
+            <div class="form-actions" style="justify-content: flex-end;">
+              <button type="button" id="cancel-cpw" class="btn btn-secondary">Cancel</button>
+              <button type="submit" class="btn btn-primary">Update Password</button>
+            </div>
+          </form>
+        `,
+        () => {
+          document.getElementById('cancel-cpw').addEventListener('click', closeModal);
+          document.getElementById('change-pw-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            try {
+              await api('/api/auth/change-password', {
+                method: 'POST',
+                body: JSON.stringify({
+                  currentPassword: document.getElementById('cur-pw').value,
+                  newPassword: document.getElementById('new-pw').value,
+                }),
+              });
+              closeModal();
+              toast('Your password has been updated.');
+            } catch (err) {
+              toast(err.message, true);
+            }
+          });
+        }
+      );
+    });
+
     document.getElementById('logout-btn')?.addEventListener('click', async () => {
       await api('/api/auth/logout', { method: 'POST' });
       state.user = null;
@@ -1055,6 +1156,7 @@
   }
 
   function renderBossTeamTab() {
+    const resetRequests = state.team.filter((m) => Boolean(m.resetRequestedAt));
     const memberRows = state.team
       .map(
         (m) => `
@@ -1068,6 +1170,11 @@
           <span class="status-pill ${m.isActive ? 'active' : 'inactive'}">
             ${m.isActive ? 'Active' : 'Disabled'}
           </span>
+          ${
+            m.resetRequestedAt
+              ? `<span class="status-pill warn" style="margin-left: 4px;">Reset Requested</span>`
+              : ''
+          }
         </td>
         <td class="col-actions">
           <button type="button" class="btn btn-ghost btn-sm" data-reset-pw="${m.id}" data-member-name="${escapeHtml(m.name)}">
@@ -1094,6 +1201,17 @@
     appEl.innerHTML = `
       ${renderTopbar(true)}
       <main class="container">
+        ${
+          resetRequests.length > 0
+            ? `
+          <div class="alert alert-warn" style="margin-bottom: 0;">
+            <strong>Password reset requested:</strong> ${resetRequests
+              .map((m) => escapeHtml(m.name))
+              .join(', ')} — click <em>Reset Password</em> in the directory below to issue a temporary password.
+          </div>
+        `
+            : ''
+        }
         <section class="card">
           <div class="card-header">
             <div class="card-title-group">
@@ -1263,6 +1381,8 @@
                   }),
                 });
                 closeModal();
+                await refreshWorkspaceData();
+                render();
                 toast('Password updated and old sessions signed out.');
               } catch (err) {
                 toast(err.message, true);

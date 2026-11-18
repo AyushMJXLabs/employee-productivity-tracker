@@ -268,6 +268,8 @@ function createApp(db, config) {
         return res.status(403).json({ error: 'This account has been deactivated. Contact your lead.' });
       }
 
+      await db.run('UPDATE users SET reset_requested_at = NULL WHERE id = $1', [user.id]);
+
       setSessionCookie(res, user, config);
       return res.json({
         user: {
@@ -278,6 +280,81 @@ function createApp(db, config) {
           createdAt: user.created_at,
         },
       });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Request a password reset (flagged for the Boss in Team & Access; never leaks email existence)
+  app.post('/api/auth/forgot-password', async (req, res, next) => {
+    try {
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const inviteCode = String(req.body?.inviteCode || '').trim();
+
+      if (!isValidEmail(email)) {
+        return res.status(400).json({ error: 'Please enter a valid work email address.' });
+      }
+
+      const setting = await db.get('SELECT value FROM settings WHERE key = $1', [
+        'team_invite_code',
+      ]);
+      const expectedCode = setting?.value || config.teamInviteCode;
+      if (!inviteCode || !safeEqualStrings(inviteCode, expectedCode, config.sessionSecret)) {
+        return res.status(403).json({ error: 'Invalid team invite code.' });
+      }
+
+      await db.run(
+        "UPDATE users SET reset_requested_at = $1 WHERE email = $2 AND role = 'employee'",
+        [new Date().toISOString(), email]
+      );
+
+      return res.json({
+        ok: true,
+        message:
+          'If an account matches that email, a password reset request has been flagged for your executive lead.',
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Change password for the currently signed-in user
+  app.post('/api/auth/change-password', requireAuth, async (req, res, next) => {
+    try {
+      const currentPassword = String(req.body?.currentPassword || '');
+      const newPassword = String(req.body?.newPassword || '');
+
+      if (!currentPassword) {
+        return res.status(400).json({ error: 'Current password is required.' });
+      }
+      if (newPassword.length < 6 || newPassword.length > 128) {
+        return res.status(400).json({ error: 'New password must be at least 6 characters.' });
+      }
+
+      const user = await db.get(
+        'SELECT id, password_hash, token_version FROM users WHERE id = $1',
+        [req.user.id]
+      );
+      if (!user) {
+        return res.status(401).json({ error: 'Authentication required.' });
+      }
+
+      const match = await bcrypt.compare(currentPassword, user.password_hash);
+      if (!match) {
+        return res.status(401).json({ error: 'Current password is incorrect.' });
+      }
+
+      const newHash = await bcrypt.hash(newPassword, 10);
+      const updated = await db.run(
+        `UPDATE users
+         SET password_hash = $1, token_version = token_version + 1, reset_requested_at = NULL
+         WHERE id = $2
+         RETURNING id, token_version`,
+        [newHash, req.user.id]
+      );
+
+      setSessionCookie(res, updated.rows[0], config);
+      return res.json({ ok: true });
     } catch (err) {
       next(err);
     }
@@ -327,7 +404,7 @@ function createApp(db, config) {
           [todayStart]
         );
         const projectRows = await db.query(
-          'SELECT DISTINCT project FROM work_logs ORDER BY LOWER(project) ASC'
+          'SELECT DISTINCT project, LOWER(project) AS sort_key FROM work_logs ORDER BY sort_key ASC'
         );
         const employeeRows = await db.query(
           "SELECT id, name FROM users WHERE role = 'employee' ORDER BY LOWER(name) ASC"
@@ -367,7 +444,7 @@ function createApp(db, config) {
         [req.user.id, weekStart]
       );
       const myProjects = await db.query(
-        'SELECT DISTINCT project FROM work_logs WHERE user_id = $1 ORDER BY LOWER(project) ASC',
+        'SELECT DISTINCT project, LOWER(project) AS sort_key FROM work_logs WHERE user_id = $1 ORDER BY sort_key ASC',
         [req.user.id]
       );
 
@@ -555,12 +632,13 @@ function createApp(db, config) {
           u.email,
           u.role,
           u.is_active,
+          u.reset_requested_at,
           u.created_at,
           COUNT(w.id) AS entry_count,
           MAX(w.logged_at) AS last_logged_at
         FROM users u
         LEFT JOIN work_logs w ON w.user_id = u.id
-        GROUP BY u.id, u.name, u.email, u.role, u.is_active, u.created_at
+        GROUP BY u.id, u.name, u.email, u.role, u.is_active, u.reset_requested_at, u.created_at
         ORDER BY CASE WHEN u.role = 'boss' THEN 0 ELSE 1 END, LOWER(u.name) ASC
       `);
 
@@ -576,6 +654,7 @@ function createApp(db, config) {
           email: m.email,
           role: m.role,
           isActive: Number(m.is_active) === 1,
+          resetRequestedAt: m.reset_requested_at || null,
           createdAt: m.created_at,
           entryCount: Number(m.entry_count || 0),
           lastLoggedAt: m.last_logged_at || null,
@@ -680,6 +759,7 @@ function createApp(db, config) {
         const hash = await bcrypt.hash(req.body.password, 10);
         updates.push(`password_hash = ${push(hash)}`);
         updates.push('token_version = token_version + 1');
+        updates.push('reset_requested_at = NULL');
       }
 
       if (updates.length === 0) {

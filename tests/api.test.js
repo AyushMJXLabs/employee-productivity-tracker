@@ -266,6 +266,50 @@ test('Full isolation, multi-entry logging, and executive oversight', async () =>
     });
     assert.equal(bobRelogin.status, 200);
     assert.equal((await empB.request('/api/logs')).body.logs.length, 1);
+
+    // 9. Forgot password request requires invite code, does not leak email existence, and flags boss
+    const forgotWrongCode = await anon.request('/api/auth/forgot-password', {
+      method: 'POST',
+      body: JSON.stringify({ email: 'bob@mjx.local', inviteCode: 'BAD' }),
+    });
+    assert.equal(forgotWrongCode.status, 403);
+
+    const forgotUnknown = await anon.request('/api/auth/forgot-password', {
+      method: 'POST',
+      body: JSON.stringify({ email: 'nobody@mjx.local', inviteCode: 'INVITE-2026' }),
+    });
+    assert.equal(forgotUnknown.status, 200);
+
+    const forgotBob = await anon.request('/api/auth/forgot-password', {
+      method: 'POST',
+      body: JSON.stringify({ email: 'bob@mjx.local', inviteCode: 'INVITE-2026' }),
+    });
+    assert.equal(forgotBob.status, 200);
+
+    const teamWithFlag = await boss.request('/api/boss/team');
+    const bobMember = teamWithFlag.body.members.find((m) => m.email === 'bob@mjx.local');
+    assert.ok(bobMember.resetRequestedAt);
+
+    // 10. Self-service change password updates hash, clears flag, and keeps caller signed in
+    const badChange = await empB.request('/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ currentPassword: 'wrong', newPassword: 'BrandNewPassword1' }),
+    });
+    assert.equal(badChange.status, 401);
+
+    const goodChange = await empB.request('/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({
+        currentPassword: 'NewBobPassword99',
+        newPassword: 'BrandNewPassword1',
+      }),
+    });
+    assert.equal(goodChange.status, 200);
+    assert.equal((await empB.request('/api/logs')).status, 200);
+
+    const teamCleared = await boss.request('/api/boss/team');
+    const bobCleared = teamCleared.body.members.find((m) => m.email === 'bob@mjx.local');
+    assert.equal(bobCleared.resetRequestedAt, null);
   } finally {
     await srv.close();
   }

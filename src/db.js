@@ -116,9 +116,20 @@ async function initSchema(db, config) {
       role TEXT NOT NULL CHECK (role IN ('boss', 'employee')),
       is_active INTEGER NOT NULL DEFAULT 1,
       token_version INTEGER NOT NULL DEFAULT 1,
+      reset_requested_at TEXT,
       created_at TEXT NOT NULL
     )
   `);
+
+  // Safe migration for existing databases created before reset_requested_at existed
+  if (db.type === 'postgres') {
+    await db.run('ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_requested_at TEXT');
+  } else {
+    const cols = await db.query('PRAGMA table_info(users)');
+    if (!cols.some((c) => c.name === 'reset_requested_at')) {
+      await db.run('ALTER TABLE users ADD COLUMN reset_requested_at TEXT');
+    }
+  }
 
   await db.run(`
     CREATE TABLE IF NOT EXISTS work_logs (
@@ -166,6 +177,15 @@ async function initSchema(db, config) {
         [config.bossName || 'Internship Lead', config.bossEmail, passwordHash, new Date().toISOString()]
       );
       console.log(`[db] Seeded initial boss account: ${config.bossEmail}`);
+    } else if (process.env.BOSS_FORCE_PASSWORD_RESET === 'true') {
+      const passwordHash = await bcrypt.hash(config.bossPassword, 10);
+      await db.run(
+        `UPDATE users
+         SET password_hash = $1, token_version = token_version + 1, reset_requested_at = NULL
+         WHERE id = $2`,
+        [passwordHash, bossRow.id]
+      );
+      console.log('[db] Reset boss password via BOSS_FORCE_PASSWORD_RESET.');
     }
   }
 }
